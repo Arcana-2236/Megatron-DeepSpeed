@@ -36,8 +36,10 @@ def update_rotary_pos_emb(seq_length):
     # partial rotary embeddings, which is better than full rotary
     # Wang and Komatsuzaki et al
     # https://github.com/kingoflolz/mesh-transformer-jax/
-    rotary_pos_emb = RotaryEmbedding(rotary_dim, theta=args.rope_theta)(seq_length).to(
-        get_accelerator().current_device_name())
+    rotary_pos_emb = RotaryEmbedding(rotary_dim, theta=args.rope_theta)(seq_length)
+    if isinstance(rotary_pos_emb, list):  # Fix list issue
+        rotary_pos_emb = torch.stack(rotary_pos_emb)  # Convert list to tensor
+    rotary_pos_emb = rotary_pos_emb.to(get_accelerator().current_device_name())  # Now use `.to()`
     args.rotary_pos_emb = rotary_pos_emb
 
 

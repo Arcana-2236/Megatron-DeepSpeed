@@ -6,35 +6,35 @@ set -ex
 # Change the below configurations here
 BASE_PATH=./tmp
 DS_CONFIG=${BASE_PATH}/deepspeed.json
-DATASET_1="./tmp/data/bookcorpus_train_1m_text_sentence"
+DATASET_1="./tmp/data/dummy_llama_text_document"
 DATASET="1 ${DATASET_1}"
-CHECKPOINT_PATH=./tmp
-TOKENIZER_PATH=./tmp/tokenizer.model # offical llama tokenizer.model
+CHECKPOINT_PATH=./tmp/checkpoints
+# TOKENIZER_PATH=./tmp/llama2_7b_tokenizer.model # offical llama tokenizer.model
 
-TP=2
-PP=2
+TP=1
+PP=1
 ZERO_STAGE=0
 
-GPUS_PER_NODE=8
+GPUS_PER_NODE=1
 MASTER_ADDR=localhost
 MASTER_PORT=6000
 NNODES=1
 NODE_RANK=0
 
 HIDDEN_SIZE=2048 # e.g. llama-13b: 5120
-FFN_HIDDEN_SIZE=5504 # e.g. llama-13b: 13824
+FFN_HIDDEN_SIZE=5472 # e.g. llama-13b: 13824
 NUM_LAYERS=24 # e.g. llama-13b: 40
-NUM_HEADS=16 # e.g. llama-13b: 40
-SEQ_LENGTH=2048
-NUM_KV_HEADS=4 # llama2 70B uses GQA
+NUM_HEADS=32 # e.g. llama-13b: 40
+SEQ_LENGTH=256
+NUM_KV_HEADS=32 # llama2 70B uses GQA
 
-MICRO_BATCH_SIZE=4
-GLOBAL_BATCH_SIZE=32 # e.g. llama: 4M tokens
-TRAIN_STEPS=250000 # e.g. llama: 1T tokens / 4M tokens_per_batch = 250000 steps
+MICRO_BATCH_SIZE=16
+GLOBAL_BATCH_SIZE=16 # e.g. llama: 4M tokens
+TRAIN_STEPS=10 # e.g. llama: 1T tokens / 4M tokens_per_batch = 250000 steps
 LR=3e-4
-MIN_LR=3e-5
-LR_WARMUP_STEPS=2000
-WEIGHT_DECAY=0.1
+MIN_LR=1e-5
+LR_WARMUP_STEPS=2
+WEIGHT_DECAY=0.01
 GRAD_CLIP=1
 
 ## Activation checkpointing saves GPU memory, but reduces training speed
@@ -115,8 +115,8 @@ torchrun $DISTRIBUTED_ARGS \
        --load $CHECKPOINT_PATH \
        --data-path $DATASET \
        --data-impl mmap \
-       --tokenizer-type GPTSentencePieceTokenizer \
-       --tokenizer-model $TOKENIZER_PATH \
+       --tokenizer-type NullTokenizer \
+       --vocab-size 31980 \
        --split 949,50,1 \
        --distributed-backend nccl \
        --lr $LR \

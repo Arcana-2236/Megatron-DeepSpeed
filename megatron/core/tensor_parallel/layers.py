@@ -278,6 +278,8 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         else:
             total_input = input
 
+        print(f"total_input.shape: {total_input.shape}")
+        print(f"weight.shape: {weight.shape}")
         output = torch.matmul(total_input, weight.t())
         if bias is not None:
             output = output + bias
