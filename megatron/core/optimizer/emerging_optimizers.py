@@ -768,6 +768,15 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         if partition_dim == -1:
             partition_dim = None
 
+        if getattr(p, 'is_gtp_weight_remat', False) and self.pg_collection:
+            is_expert = getattr(p, 'expert_tp', False)
+            _gtp_group = self.pg_collection.expt_gtp_remat if is_expert else self.pg_collection.gtp_remat
+            gtp_size = get_pg_size(_gtp_group)
+        else:
+            gtp_size = 1
+        full_shape = (p.shape[0] * gtp_size, *p.shape[1:])
+        torch.cuda.nvtx.range_push(f"muon_ns:{full_shape}")
+
         if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
             grad_shape = grad.shape
             qkv_split_shapes = getattr(p, "qkv_split_shapes", None)
@@ -801,6 +810,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             grad = torch.cat(qkv_grads, dim=1).view(grad_shape)
         else:
             grad = self.scaled_orthogonalize_fn_with_gtp_remat(p, grad, tp_group, partition_dim)
+
+        torch.cuda.nvtx.range_pop()
         return grad
 
 
