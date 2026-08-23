@@ -141,16 +141,24 @@ def owned_matrices(matrices: List, dp_size: int, dp_rank: int) -> List:
 # --------------------------------------------------------------------------------------
 
 
-def ns_step_flops(m: int, n: int) -> float:
+def ns_step_flops(m: int, n: int, use_syrk: bool = False) -> float:
     """FLOPs for one Newton-Schulz step on an (m, n) matrix with m <= n.
 
     Per ``newton_schulz_step``: ``A = X @ X.mT`` costs 2*m^2*n, ``B = A @ A`` costs 2*m^3,
     and ``X = B @ X`` costs 2*m^2*n.
+
+    With ``use_syrk`` the two symmetric products run as triangular kernels at half the
+    FLOPs -- ``A = X @ X.mT`` costs m^2*n and ``B = A @ A`` costs m^3 -- while ``X = B @ X``
+    stays a general GEMM. That is 25% fewer FLOPs when m << n, rising to 33% at m == n.
     """
+    if use_syrk:
+        return 3.0 * m * m * n + 1.0 * m * m * m
     return 4.0 * m * m * n + 2.0 * m * m * m
 
 
-def flop_model(matrix, mode: str, steps: int, group_size: int) -> Tuple[float, float]:
+def flop_model(
+    matrix, mode: str, steps: int, group_size: int, use_syrk: bool = False
+) -> Tuple[float, float]:
     """Return (issued, useful) FLOPs on one GPU for one orthogonalization.
 
     ``useful`` is the irreducible share: orthogonalizing the full matrix once, divided
@@ -168,18 +176,18 @@ def flop_model(matrix, mode: str, steps: int, group_size: int) -> Tuple[float, f
     """
     (rows, cols), shard_count = matrix
     if shard_count == 1:
-        issued = ns_step_flops(min(rows, cols), max(rows, cols)) * steps
+        issued = ns_step_flops(min(rows, cols), max(rows, cols), use_syrk) * steps
         return issued, issued
 
     full_rows, full_cols = rows * shard_count, cols
     fm, fn = min(full_rows, full_cols), max(full_rows, full_cols)
-    useful = ns_step_flops(fm, fn) * steps / shard_count
+    useful = ns_step_flops(fm, fn, use_syrk) * steps / shard_count
 
     if mode == "blockwise":
-        issued = ns_step_flops(min(rows, cols), max(rows, cols)) * steps
+        issued = ns_step_flops(min(rows, cols), max(rows, cols), use_syrk) * steps
     elif mode == "duplicated":
         # Every rank recomputes the whole matrix, so issued is shard_count x useful.
-        issued = ns_step_flops(fm, fn) * steps
+        issued = ns_step_flops(fm, fn, use_syrk) * steps
     else:
         # distributed shards the two m^2*n GEMMs across the group; A @ A is replicated.
         # When the sharded dimension is the SHORTER one, newton_schulz runs along the long
@@ -188,7 +196,12 @@ def flop_model(matrix, mode: str, steps: int, group_size: int) -> Tuple[float, f
             m, n = fn, fm
         else:
             m, n = fm, fn
-        issued = (4.0 * m * m * n / shard_count + 2.0 * m * m * m) * steps
+        # SYRK halves the two symmetric products, so the sharded term goes 4 -> 3 and the
+        # replicated one 2 -> 1.
+        sharded_coeff, replicated_coeff = (3.0, 1.0) if use_syrk else (4.0, 2.0)
+        issued = (
+            sharded_coeff * m * m * n / shard_count + replicated_coeff * m * m * m
+        ) * steps
     return issued, useful
 
 
@@ -198,7 +211,8 @@ def flop_model(matrix, mode: str, steps: int, group_size: int) -> Tuple[float, f
 
 
 def time_strategy(
-    local_shard, group, mode, steps, coefficient_type, iters, warmup, shard_count
+    local_shard, group, mode, steps, coefficient_type, iters, warmup, shard_count,
+    use_syrk=False,
 ) -> float:
     """Return the median wall-clock milliseconds of one orthogonalization.
 
@@ -220,6 +234,7 @@ def time_strategy(
             tp_group=group,
             partition_dim=partition_dim,
             tp_mode=tp_mode,
+            use_syrk=use_syrk,
         )
 
     for _ in range(warmup):
@@ -265,6 +280,12 @@ def main() -> None:
     # matrix, which changes the update rather than distributing the same one. Pass it
     # explicitly (--modes blockwise duplicated distributed) if you want it as a floor.
     parser.add_argument("--modes", nargs="+", default=["duplicated", "distributed"])
+    # Forwarded to newton_schulz_tp. SYRK replaces the two symmetric products with
+    # half-FLOP triangular kernels; it only takes effect at --fp32-matmul-prec medium and
+    # needs both dims to be multiples of 8. ns_step_flops/flop_model follow the flag, so
+    # the FLOP columns stay self-consistent -- but GF is then on a different cost model
+    # than a GEMM-path run and must not be compared across the two.
+    parser.add_argument("--use-syrk", action="store_true")
     # Newton-Schulz requires fp32: it runs on Muon's momentum, which the optimizer keeps
     # in fp32 regardless of the parameter dtype. bf16 raises ValueError.
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16"])
@@ -321,8 +342,12 @@ def main() -> None:
     )
     log(
         f"fp32_matmul_precision={torch.get_float32_matmul_precision()} "
-        f"(medium casts the GEMMs to bf16)\n"
+        f"(medium casts the GEMMs to bf16)"
     )
+    if config.use_syrk:
+        log("use_syrk=True: FLOP columns use the SYRK cost model (3m^2n + m^3 per step),")
+        log("so GF is NOT comparable to a GEMM-path run; ms and TF/s are.")
+    log("")
 
     dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float32
     errors: Dict[str, List[str]] = {}
@@ -344,7 +369,9 @@ def main() -> None:
         shard = torch.randn((rows, cols), device="cuda", dtype=dtype)
         timings: Dict[str, float] = {}
         for mode in config.modes:
-            issued, useful = flop_model(matrix, mode, config.num_ns_steps, group_size)
+            issued, useful = flop_model(
+                matrix, mode, config.num_ns_steps, group_size, config.use_syrk
+            )
             try:
                 ms = time_strategy(
                     shard,
@@ -355,6 +382,7 @@ def main() -> None:
                     config.iters,
                     config.warmup,
                     shard_count,
+                    config.use_syrk,
                 )
                 timings[mode] = ms
                 log(
@@ -388,7 +416,8 @@ def main() -> None:
         for mode in config.modes:
             total_ms = sum(per_shape[e][mode] * n for e, n in signature)
             useful = sum(
-                flop_model(e, mode, config.num_ns_steps, group_size)[1] * n for e, n in signature
+                flop_model(e, mode, config.num_ns_steps, group_size, config.use_syrk)[1] * n
+                for e, n in signature
             )
             totals[mode].append(total_ms)
             useful_totals[mode].append(useful)
