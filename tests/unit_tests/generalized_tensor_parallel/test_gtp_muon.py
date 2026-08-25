@@ -84,10 +84,10 @@ def _make_muon(pg_collection, tp_mode="distributed"):
     )
 
 
-def _full_weight():
-    """Full [M, K] momentum, identical on every rank (rank-0 broadcast)."""
+def _full_weight(m=None, k=None):
+    """Full [m, k] momentum, identical on every rank (rank-0 broadcast)."""
     torch.manual_seed(0)
-    w = torch.randn(_M, _K, dtype=torch.float32, device="cuda")
+    w = torch.randn(m or _M, k or _K, dtype=torch.float32, device="cuda")
     torch.distributed.broadcast(w, src=0)
     return w
 
@@ -114,27 +114,60 @@ def _init_model_parallel(tp_size, gtp_remat_size):
     )
 
 
-def _worker_gtp_only_parity(rank, world_size, port, tp_mode):
+def _worker_gtp_only_parity(rank, world_size, port, tp_mode, shape=None):
     """distributed and duplicated (TP1): the local GTP shard must match full-matrix NS.
 
     Both modes are mathematically identical to orthogonalizing the whole matrix, one by
     distributing the Gram all-reduce over GTP and one by all-gathering first.
+
+    ``shape`` covers both orientations. With M > N, ``distributed`` transposes and the Gram
+    is [N, N]. With M < N it instead all-to-alls to a column shard and runs partition_dim=1
+    so the Gram is [M, M]; that branch is unreachable at the default M > N shape.
     """
+    m, k = shape or (_M, _K)
     _init_model_parallel(1, world_size)
     try:
         pgc = ProcessGroupCollection.use_mpu_process_groups()
         opt = _make_muon(pgc, tp_mode=tp_mode)
-        w = _full_weight()
+        w = _full_weight(m, k)
         ref = _reference_full_orth(opt, w, pgc.tp)
 
         gs, gr = _world_size(pgc.gtp_remat), _rank(pgc.gtp_remat)
-        sp = _M // gs
+        sp = m // gs
         local = w[gr * sp : (gr + 1) * sp, :].clone()
         local.is_gtp_weight_remat = True
 
         out = opt.scaled_orthogonalize_fn_with_gtp_remat(local, local, pgc.tp, None)
         expected = ref[gr * sp : (gr + 1) * sp, :]
         torch.testing.assert_close(out, expected, atol=_ATOL, rtol=_RTOL)
+    finally:
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+
+
+def _worker_all_to_all_round_trip(rank, world_size, port):
+    """Row-shard -> column-shard -> row-shard must return the original shard exactly.
+
+    Guards the chunk/cat rank ordering in _all_to_all_tensor, which is easy to get wrong
+    and which the parity tests would only reveal indirectly.
+    """
+    _init_model_parallel(1, world_size)
+    try:
+        pgc = ProcessGroupCollection.use_mpu_process_groups()
+        opt = _make_muon(pgc, tp_mode="distributed")
+        w = _full_weight(_K, _M)  # M < N, the orientation that reshards
+
+        gs, gr = _world_size(pgc.gtp_remat), _rank(pgc.gtp_remat)
+        sp = _K // gs
+        local = w[gr * sp : (gr + 1) * sp, :].clone()
+
+        col = opt._all_to_all_tensor(local, pgc.gtp_remat, scatter_dim=1, gather_dim=0)
+        assert col.shape == (_K, _M // gs), col.shape
+        # The column shard must equal the matching slice of the full matrix.
+        torch.testing.assert_close(col, w[:, gr * (_M // gs) : (gr + 1) * (_M // gs)])
+
+        back = opt._all_to_all_tensor(col, pgc.gtp_remat, scatter_dim=0, gather_dim=1)
+        torch.testing.assert_close(back, local)
     finally:
         ps.destroy_model_parallel()
         ps.initialize_model_parallel()
@@ -235,6 +268,20 @@ class TestGTPMuonDistributedNS:
     def test_gtp_only_parity(self, world_size, tp_mode):
         _requires_multi_gpu(world_size)
         _run_distributed(_worker_gtp_only_parity, world_size, tp_mode)
+
+    # M < N: `distributed` reshards via all-to-all and runs partition_dim=1 instead of
+    # transposing. Parity with full-matrix NS is the same contract as above.
+    @pytest.mark.parametrize("tp_mode", ["distributed", "duplicated", "auto"])
+    @pytest.mark.parametrize("world_size", _GTP_ONLY_WORLD_SIZES)
+    def test_gtp_only_parity_wide(self, world_size, tp_mode):
+        _requires_multi_gpu(world_size)
+        _run_distributed(_worker_gtp_only_parity, world_size, tp_mode, (_K, _M))
+
+    @pytest.mark.parametrize("world_size", _GTP_ONLY_WORLD_SIZES)
+    def test_all_to_all_round_trip(self, world_size):
+        """A2A forward then back is the identity, independent of Newton-Schulz."""
+        _requires_multi_gpu(world_size)
+        _run_distributed(_worker_all_to_all_round_trip, world_size)
 
     @pytest.mark.parametrize("tp_size,gtp_remat_size", _TP_GTP_SHAPES)
     def test_row_parallel(self, tp_size, gtp_remat_size):

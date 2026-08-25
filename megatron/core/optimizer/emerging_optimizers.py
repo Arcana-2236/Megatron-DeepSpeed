@@ -346,6 +346,20 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         return torch.cat(shards, dim=dim)
 
     @staticmethod
+    def _all_to_all_tensor(t, group, scatter_dim, gather_dim):
+        """Re-shard ``t`` over ``group``: split along ``scatter_dim``, concat along ``gather_dim``.
+
+        Moves a tensor sharded on ``gather_dim`` to one sharded on ``scatter_dim``. With
+        ``scatter_dim=1, gather_dim=0`` a row-sharded ``[M/G, N]`` becomes a column-sharded
+        ``[M, N/G]``; swapping the two arguments inverts it. Both dims must divide ``G``.
+        """
+        group_size = get_pg_size(group)
+        send = [c.contiguous() for c in t.chunk(group_size, dim=scatter_dim)]
+        recv = [torch.empty_like(c) for c in send]
+        torch.distributed.all_to_all(recv, send, group)
+        return torch.cat(recv, dim=gather_dim)
+
+    @staticmethod
     def _strip_pad(t, pad_length):
         """Drop the trailing ``pad_length`` rows of dim 0 (no-op if ``pad_length == 0``)."""
         return t[:-pad_length] if pad_length else t
@@ -481,6 +495,23 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
         if not needs_two_step_communication:
             # GTP is the only sharding axis: distribute NS over it on the local dim-0 row shard.
+            #
+            # partition_dim=0 forces transpose=True in newton_schulz_tp, so NS runs on
+            # [N, M/G] and the Gram is [N, N]. That is only right when N is the SHORT dim;
+            # when M < N it puts the Gram, and its replicated N^3 term, on the LONG dim --
+            # the waste newton_schulz_tp's own docstring warns about. So pick the
+            # orientation that lands the Gram on min(M, N), the same rule newton_schulz
+            # already applies to non-TP input via transpose = x.size(-2) > x.size(-1):
+            #   M > N  ->  partition_dim=0, transpose, Gram [N, N]  (unchanged)
+            #   M < N  ->  all-to-all to column-sharded, partition_dim=1, Gram [M, M]
+            # Only N % G matters: the return all-to-all splits dim 0 of [M, N/G], and
+            # M = grad.size(0) * G is divisible by construction. Indivisible N falls back.
+            full_rows = grad.size(0) * gtp_remat_size
+            cols = grad.size(1)
+            if full_rows < cols and cols % gtp_remat_size == 0:
+                x = self._all_to_all_tensor(grad, gtp_remat_group, scatter_dim=1, gather_dim=0)
+                x = self.scaled_orthogonalize_fn(x, gtp_remat_group, 1, tp_mode_this_group=mode)
+                return self._all_to_all_tensor(x, gtp_remat_group, scatter_dim=0, gather_dim=1)
             return self.scaled_orthogonalize_fn(
                 grad, gtp_remat_group, partition_dim=0, tp_mode_this_group=mode
             )
