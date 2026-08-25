@@ -61,6 +61,17 @@ try:
 except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
 
+# Only needed for --modes auto, which replays TensorParallelMuon's own per-weight cost
+# model. Importing it rather than reimplementing it is deliberate: the cost model is the
+# thing under test, and a copy here would drift and then silently validate the wrong
+# formula. Requires the Megatron repo root on PYTHONPATH.
+try:
+    from megatron.core.optimizer.emerging_optimizers import _hardware_profile, _select_tp_mode
+
+    HAVE_MEGATRON = True
+except ImportError:
+    HAVE_MEGATRON = False
+
 # --------------------------------------------------------------------------------------
 # Nemotron-4 (152-layer hybrid Mamba-MoE), matching the training recipe.
 # --------------------------------------------------------------------------------------
@@ -210,6 +221,36 @@ def flop_model(
 # --------------------------------------------------------------------------------------
 
 
+AUTO_MODE = "auto"
+
+
+def resolve_auto_mode(matrix, config, profile) -> str:
+    """The concrete mode TensorParallelMuon would pick for this weight under tp_mode="auto".
+
+    Mirrors scaled_orthogonalize_fn_with_gtp_remat's SCOPING as well as its cost model --
+    the two guards below are why auto is not simply _select_tp_mode everywhere:
+
+    - shard_count == 1: the weight is not GTP-sharded, so gtp_active is False and Megatron
+      never consults the cost model.
+    - --group egtp: candidate A restricts auto to dense weights; expert weights keep the
+      duplicated fallback.
+    """
+    (rows, cols), shard_count = matrix
+    if shard_count == 1 or config.group == "egtp":
+        return "duplicated"
+    return _select_tp_mode(
+        rows * shard_count,
+        cols,
+        shard_count,
+        config.num_ns_steps,
+        config.use_syrk,
+        2 if config.fp32_matmul_prec == "medium" else 4,
+        # Dense GTP stays inside one NVLink domain, matching _resolve_tp_mode.
+        communication_crosses_domain=False,
+        profile=profile,
+    )
+
+
 def time_strategy(
     local_shard, group, mode, steps, coefficient_type, iters, warmup, shard_count,
     use_syrk=False,
@@ -279,6 +320,9 @@ def main() -> None:
     # blockwise is not used in practice: it orthogonalizes each block rather than the
     # matrix, which changes the update rather than distributing the same one. Pass it
     # explicitly (--modes blockwise duplicated distributed) if you want it as a floor.
+    # "auto" is a synthetic mode: it runs no kernels of its own, it selects per shape
+    # between the modes that were timed anyway. It therefore requires duplicated and
+    # distributed to be present, e.g. --modes duplicated distributed auto.
     parser.add_argument("--modes", nargs="+", default=["duplicated", "distributed"])
     # Forwarded to newton_schulz_tp. SYRK replaces the two symmetric products with
     # half-FLOP triangular kernels; it only takes effect at --fp32-matmul-prec medium and
@@ -302,6 +346,18 @@ def main() -> None:
     config = parser.parse_args()
 
     assert HAVE_EMERGING_OPTIMIZERS, "emerging_optimizers is required; pip install it first."
+
+    timed_modes = [mode for mode in config.modes if mode != AUTO_MODE]
+    if AUTO_MODE in config.modes:
+        assert HAVE_MEGATRON, (
+            "--modes auto imports _select_tp_mode from megatron.core.optimizer."
+            "emerging_optimizers; put the Megatron repo root on PYTHONPATH."
+        )
+        missing = [m for m in ("duplicated", "distributed") if m not in timed_modes]
+        assert not missing, (
+            f"--modes auto selects between duplicated and distributed, so both must also "
+            f"be timed; missing {missing}. Try: --modes duplicated distributed auto"
+        )
 
     torch.set_float32_matmul_precision(config.fp32_matmul_prec)
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -353,6 +409,21 @@ def main() -> None:
     errors: Dict[str, List[str]] = {}
     per_shape: Dict[Tuple, Dict[str, float]] = {}
 
+    # Per-shape mode that tp_mode="auto" would choose, and the resolver for it. Filled
+    # only when auto is requested; used to alias auto's timings and FLOPs onto that mode.
+    auto_choice: Dict[Tuple, str] = {}
+    hw_profile = _hardware_profile() if AUTO_MODE in config.modes else None
+    if AUTO_MODE in config.modes:
+        log(
+            f"auto: cost model on {'the ' + type(hw_profile).__name__ if hw_profile else 'NO'} "
+            f"hardware profile"
+            + ("" if hw_profile else " (degrades to a FLOPs-only comparison)")
+        )
+
+    def effective_mode(matrix, mode: str) -> str:
+        """auto is an alias for whichever real mode the cost model picked for this shape."""
+        return auto_choice[matrix] if mode == AUTO_MODE else mode
+
     log("PER-SHAPE  (issued = FLOPs this GPU executes; useful = its share of orthogonalizing")
     log("            the full matrix once; redundancy = issued / useful)")
     header = (
@@ -368,7 +439,7 @@ def main() -> None:
         gathered = f"{rows * shard_count}x{cols}"
         shard = torch.randn((rows, cols), device="cuda", dtype=dtype)
         timings: Dict[str, float] = {}
-        for mode in config.modes:
+        for mode in timed_modes:
             issued, useful = flop_model(
                 matrix, mode, config.num_ns_steps, group_size, config.use_syrk
             )
@@ -393,6 +464,9 @@ def main() -> None:
             except Exception as error:  # noqa: BLE001 - report and keep going
                 log(f"{f'{rows}x{cols}':>13}{gathered:>14}{mode:>13}{type(error).__name__:>56}")
                 errors.setdefault(f"{type(error).__name__}: {error}", []).append(mode)
+        if AUTO_MODE in config.modes and not errors:
+            auto_choice[matrix] = resolve_auto_mode(matrix, config, hw_profile)
+            timings[AUTO_MODE] = timings[auto_choice[matrix]]
         per_shape[matrix] = timings
 
     if errors:
@@ -416,7 +490,7 @@ def main() -> None:
         for mode in config.modes:
             total_ms = sum(per_shape[e][mode] * n for e, n in signature)
             useful = sum(
-                flop_model(e, mode, config.num_ns_steps, group_size, config.use_syrk)[1] * n
+                flop_model(e, effective_mode(e, mode), config.num_ns_steps, group_size, config.use_syrk)[1] * n
                 for e, n in signature
             )
             totals[mode].append(total_ms)
@@ -435,6 +509,34 @@ def main() -> None:
         mean = sum(t * len(r) for t, r in zip(totals[mode], profiles.values())) / dp_size
         imbalance += f"{max(totals[mode]) / mean:>11.2f}x{'':>8}"
     log(imbalance)
+
+    if AUTO_MODE in config.modes:
+        # The point of this table: "auto" is the cost model's PREDICTION, while the oracle
+        # is the mode that actually measured fastest. Rows where they differ are cost-model
+        # errors, and "regret" prices each one in ms. A perfect model has zero regret; the
+        # oracle is auto's ceiling, not its expectation.
+        log("\nAUTO MODE SELECTION  (cost model prediction vs measured winner)")
+        head = f"{'shape':>15}{'predicted':>13}{'oracle':>13}{'agree':>7}{'pred ms':>10}{'oracle ms':>11}{'regret ms':>11}"
+        log(head)
+        log("-" * len(head))
+        agree_count, regret_total = 0, 0.0
+        for matrix in distinct:
+            (rows, cols), shard_count = matrix
+            predicted = auto_choice[matrix]
+            oracle = min(timed_modes, key=lambda m: per_shape[matrix][m])
+            pred_ms, oracle_ms = per_shape[matrix][predicted], per_shape[matrix][oracle]
+            regret = pred_ms - oracle_ms
+            agree_count += predicted == oracle
+            regret_total += regret
+            log(
+                f"{f'{rows * shard_count}x{cols}':>15}{predicted:>13}{oracle:>13}"
+                f"{'yes' if predicted == oracle else 'NO':>7}{pred_ms:>10.3f}{oracle_ms:>11.3f}{regret:>11.3f}"
+            )
+        log("-" * len(head))
+        log(f"  agreement {agree_count}/{len(distinct)} shapes, total per-shape regret {regret_total:.3f} ms")
+        if config.group == "egtp":
+            log("  NOTE: --group egtp, so auto is pinned to duplicated by candidate A's")
+            log("  dense-only scoping. This table shows what the scoping COSTS, not a cost-model error.")
 
     best = min(config.modes, key=lambda m: max(totals[m]))
     log(f"\nfastest step: {best} ({max(totals[best]):.3f} ms)")

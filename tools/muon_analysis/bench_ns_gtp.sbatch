@@ -57,7 +57,11 @@ options=" \
     --coefficient-type polar_express \
     --iters 20 \
     --warmup 5 \
+    --modes ${MODES:-duplicated distributed} \
     ${SYRK_OPTION} "
+
+# REPO_DIR on PYTHONPATH so --modes auto can import _select_tp_mode from Megatron.
+export PYTHONPATH="${REPO_DIR}:${PYTHONPATH:-}"
 
 run_cmd="export RANK=\${SLURM_PROCID} WORLD_SIZE=\${SLURM_NTASKS} LOCAL_RANK=\${SLURM_LOCALID}; \
 python -u ${REPO_DIR}/tools/muon_analysis/bench_ns_strategies.py ${options}"
