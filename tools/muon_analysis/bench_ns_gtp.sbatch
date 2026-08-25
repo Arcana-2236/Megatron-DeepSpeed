@@ -30,7 +30,7 @@ GTP=${GTP:-64}
 
 ROOT_DIR="/lustre/fsw/coreai_dlalgo_llm/zhengywang/dist_muon"
 REPO_DIR="${ROOT_DIR}/Megatron-LM-experiments"
-IMAGE_PATH="${ROOT_DIR}/images/nvidia+pytorch+26.04-py3+dependencies+mamba+cutedsl+nvrxstable+telatest+eo0.4.0a0.sqsh"
+IMAGE_PATH="${IMAGE_PATH:-${ROOT_DIR}/images/mcore-moe-te-main-hybridep-cutedsl-arm.sqsh}"
 
 # TAG separates runs on different hardware, e.g. sbatch -p gb200 --export=ALL,TAG=gb200
 NAME="perfbot/run1/ns_bench/gtp${TAG:+_$TAG}"
