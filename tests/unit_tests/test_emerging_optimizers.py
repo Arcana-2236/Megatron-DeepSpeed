@@ -14,6 +14,7 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.emerging_optimizers import (
     _PROFILES,
     HAVE_EMERGING_OPTIMIZERS,
+    HardwareProfile,
     TensorParallelAdaptiveMuon,
     TensorParallelMuon,
     _get_qkv_split_shapes,
@@ -93,18 +94,48 @@ def test_select_tp_mode_orientation_symmetric():
     Before reshard, partition_dim=0 forced the transpose, so the wide case put the Gram on
     the long dimension and was scored ~100x worse than its transpose. The two cases now
     differ only in which branch of scaled_orthogonalize_fn_with_gtp_remat executes.
+
+    Symmetric in FLOPs and bytes, which depend only on min/max. NOT symmetric in latency:
+    the wide case reshards and pays two extra all-to-all launches. Same decision here, by
+    a slightly different margin.
     """
     profile = _PROFILES["GB200"]
     kwargs = dict(
-        group_size=8,
-        steps=5,
-        use_syrk=False,
+        group_size=64,
+        steps=16,
+        use_syrk=True,
         elem_size=2,
         communication_crosses_domain=False,
         profile=profile,
     )
-    assert _select_tp_mode(m=8192, n=1024, **kwargs) == "distributed"
-    assert _select_tp_mode(m=1024, n=8192, **kwargs) == "distributed"
+    assert _select_tp_mode(m=10240, n=20480, **kwargs) == "distributed"
+    assert _select_tp_mode(m=20480, n=10240, **kwargs) == "distributed"
+
+
+def test_select_tp_mode_alpha_flips_small_shapes():
+    """Launch latency, not bandwidth, is what keeps small shapes on duplicated.
+
+    dist issues one Gram all-reduce per step plus the zero-payload normalize scalar, so at
+    steps=16 it pays 17 collective launches against dup's single all-gather -- 2.3ms at
+    134us each. On 3072x10240 that dwarfs the whole bandwidth+FLOPs cost, and it is the
+    difference between agreeing and disagreeing with the measured winner (NT4 proxy job
+    2790308 measured duplicated faster on this shape; without alpha the model said
+    distributed).
+    """
+    kwargs = dict(
+        m=3072,
+        n=10240,
+        group_size=64,
+        steps=16,
+        use_syrk=True,
+        elem_size=2,
+        communication_crosses_domain=False,
+    )
+    zero_alpha = HardwareProfile(
+        bf16_peak_tflops=2500.0, bw_intra_gbps=900.0, bw_inter_gbps=100.0, alpha_coll_us=0.0
+    )
+    assert _select_tp_mode(**kwargs, profile=zero_alpha) == "distributed"
+    assert _select_tp_mode(**kwargs, profile=_PROFILES["GB200"]) == "duplicated"
 
 
 def test_select_tp_mode_duplicated_when_comm_dominates():

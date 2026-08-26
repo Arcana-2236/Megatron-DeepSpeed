@@ -186,14 +186,22 @@ class HardwareProfile:
     bf16_peak_tflops: float  # dense, fp32_matmul_prec = "medium" for now
     bw_intra_gbps: float  # collectives staying inside one NVLink domain
     bw_inter_gbps: float  # collectives crossing domains, over the fabric
+    alpha_coll_us: float  # Latency term, Fixed cost of ONE collective, independent of payload.
 
 
 _PROFILES = {
     # Keys are matched as a substring of the reported device name ("NVIDIA GB200").
     # Both bandwidths are PER GPU. Only run on GB200 & GB300 for now.
     # TODO: May need to add other HW Spec
-    "GB200": HardwareProfile(bf16_peak_tflops=2500.0, bw_intra_gbps=900.0, bw_inter_gbps=100.0),
-    "GB300": HardwareProfile(bf16_peak_tflops=2500.0, bw_intra_gbps=900.0, bw_inter_gbps=100.0),
+    # alpha_coll_us is the 64-rank value; it is what dense GTP uses, which is all tp_mode
+    # "auto" currently decides. A 2-rank group measures 68us, so this over-prices latency
+    # if auto is ever extended to expert weights at EGTP=2.
+    "GB200": HardwareProfile(
+        bf16_peak_tflops=2500.0, bw_intra_gbps=900.0, bw_inter_gbps=100.0, alpha_coll_us=134.0
+    ),
+    "GB300": HardwareProfile(
+        bf16_peak_tflops=2500.0, bw_intra_gbps=900.0, bw_inter_gbps=100.0, alpha_coll_us=134.0
+    ),
 }
 
 
@@ -258,9 +266,22 @@ def _select_tp_mode(
         * elem_size
         * ring_fraction,  # gram all-reduce per step, Gram is [min, min]
     }
+    # Launch/link latency, which the bandwidth term alone cannot capture: dup issues ONE
+    # all-gather while dist issues one Gram all-reduce per step, plus the zero-payload
+    # distributed_normalize_p2 scalar all-reduce, plus the two all-to-alls when it reshards.
+    # Their volume is negligible but each is a full collective launch. At steps=16 that is
+    # 17-19 launches against dup's 1, which decides every small shape.
+    num_collectives = {
+        "duplicated": 1,
+        "distributed": steps + 1 + (2 if m < n else 0),
+    }
     bw = (profile.bw_inter_gbps if communication_crosses_domain else profile.bw_intra_gbps) * 1e9
     peak = profile.bf16_peak_tflops * 1e12
-    cost = {mode: flops[mode] / peak + num_bytes[mode] / bw for mode in candidates}
+    alpha = profile.alpha_coll_us * 1e-6
+    cost = {
+        mode: flops[mode] / peak + num_bytes[mode] / bw + num_collectives[mode] * alpha
+        for mode in candidates
+    }
     return min(candidates, key=cost.get)
 
 
