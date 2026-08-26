@@ -201,17 +201,16 @@ def flop_model(
         issued = ns_step_flops(fm, fn, use_syrk) * steps
     else:
         # distributed shards the two m^2*n GEMMs across the group; A @ A is replicated.
-        # When the sharded dimension is the SHORTER one, newton_schulz runs along the long
-        # dimension instead, the waste newton_schulz_tp's docstring warns about.
-        if full_rows < full_cols:
-            m, n = fn, fm
-        else:
-            m, n = fm, fn
+        # It orients so the Gram always lands on the SHORTER dimension: transposing when
+        # the matrix is tall, and resharding to a column shard when it is wide. So the
+        # sharded term is fm^2*fn/shard_count and the replicated one is fm^3, whichever
+        # way round the matrix is. Before reshard the wide case was forced onto fn and
+        # paid fn^3, the waste newton_schulz_tp's docstring warns about.
         # SYRK halves the two symmetric products, so the sharded term goes 4 -> 3 and the
         # replicated one 2 -> 1.
         sharded_coeff, replicated_coeff = (3.0, 1.0) if use_syrk else (4.0, 2.0)
         issued = (
-            sharded_coeff * m * m * n / shard_count + replicated_coeff * m * m * m
+            sharded_coeff * fm * fm * fn / shard_count + replicated_coeff * fm * fm * fm
         ) * steps
     return issued, useful
 
@@ -267,7 +266,39 @@ def time_strategy(
     partition_dim = None if (mode == "blockwise" or shard_count == 1) else 0
     tp_mode = "duplicated" if mode == "blockwise" else mode
 
+    # distributed reshards a WIDE matrix before orthogonalizing, so the Gram lands on the
+    # shorter dimension either way: tall transposes (partition_dim=0), wide all-to-alls to
+    # a column shard and runs partition_dim=1. Deliberately reimplemented here rather than
+    # calling TensorParallelMuon.scaled_orthogonalize_fn_with_gtp_remat -- an independent
+    # implementation makes agreement between the two evidence rather than a tautology.
+    rows, cols = local_shard.shape
+    reshard = (
+        tp_mode == "distributed"
+        and partition_dim == 0
+        and rows * shard_count < cols
+        and cols % shard_count == 0
+    )
+
+    def all_to_all(t, scatter_dim, gather_dim):
+        send = [c.contiguous() for c in t.chunk(shard_count, dim=scatter_dim)]
+        recv = [torch.empty_like(c) for c in send]
+        torch.distributed.all_to_all(recv, send, group)
+        return torch.cat(recv, dim=gather_dim)
+
     def once():
+        if reshard:
+            x = all_to_all(local_shard, scatter_dim=1, gather_dim=0)
+            x = newton_schulz_tp(
+                x,
+                steps=steps,
+                coefficient_type=coefficient_type,
+                tp_group=group,
+                partition_dim=1,
+                tp_mode=tp_mode,
+                use_syrk=use_syrk,
+            )
+            all_to_all(x, scatter_dim=0, gather_dim=1)
+            return
         newton_schulz_tp(
             local_shard,
             steps=steps,
