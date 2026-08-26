@@ -66,7 +66,11 @@ except ImportError:
 # thing under test, and a copy here would drift and then silently validate the wrong
 # formula. Requires the Megatron repo root on PYTHONPATH.
 try:
-    from megatron.core.optimizer.emerging_optimizers import _hardware_profile, _select_tp_mode
+    from megatron.core.optimizer.emerging_optimizers import (
+        _hardware_profile,
+        _select_tp_mode,
+        _tp_mode_costs,
+    )
 
     HAVE_MEGATRON = True
 except ImportError:
@@ -123,15 +127,28 @@ def build_model_matrices(config) -> Tuple[List, List]:
     return dense, expert
 
 
-def ns_cost(matrix) -> int:
-    """Newton-Schulz cost of the full post-all-gather matrix, as the optimizer models it."""
+def ns_cost(matrix, layout_cost_fn=None) -> float:
+    """Cost the LayerWise layout assigns to *matrix*, driving its LPT bin-packing.
+
+    ``layout_cost_fn=None`` reproduces the legacy layout: max*min^2, i.e. the FLOP-shaped
+    ``duplicated`` cost applied to every weight whatever mode it runs.
+
+    Passing a callable reproduces the cost-aware layout, which prices each weight in
+    estimated SECONDS under the mode it will actually run. Seconds rather than FLOPs
+    because LPT balances rank TIME and under tp_mode="auto" one rank holds a mix of modes:
+    communication and launch latency are 60-80% of `distributed`'s total, so FLOP counts
+    are not comparable across modes. Reimplemented rather than imported so agreement with
+    the optimizer is evidence rather than a tautology.
+    """
     (rows, cols), shard_count = matrix
     rows *= shard_count
     big, small = max(rows, cols), min(rows, cols)
-    return big * small * small
+    if layout_cost_fn is None:
+        return float(big * small * small)
+    return layout_cost_fn(matrix)
 
 
-def owned_matrices(matrices: List, dp_size: int, dp_rank: int) -> List:
+def owned_matrices(matrices: List, dp_size: int, dp_rank: int, layout_cost_fn=None) -> List:
     """Return the matrices assigned to *dp_rank* under compute-balanced greedy LPT.
 
     Mirrors ``_emit_bucket``'s ordering so the benchmark measures what a rank really
@@ -140,9 +157,9 @@ def owned_matrices(matrices: List, dp_size: int, dp_rank: int) -> List:
     """
     loads = [0] * dp_size
     owned = [[] for _ in range(dp_size)]
-    for matrix in sorted(matrices, key=lambda e: -ns_cost(e)):
+    for matrix in sorted(matrices, key=lambda e: -ns_cost(e, layout_cost_fn)):
         shard = min(range(dp_size), key=lambda s: loads[s])
-        loads[shard] += ns_cost(matrix)
+        loads[shard] += ns_cost(matrix, layout_cost_fn)
         owned[shard].append(matrix)
     return owned[dp_rank]
 
@@ -361,6 +378,11 @@ def main() -> None:
     # the FLOP columns stay self-consistent -- but GF is then on a different cost model
     # than a GEMM-path run and must not be compared across the two.
     parser.add_argument("--use-syrk", action="store_true")
+    # Cost the LayerWise layout uses to bin-pack weights onto DP shards. "legacy" is
+    # max*min^2 for every weight; "cost-aware" prices each weight in seconds under the mode
+    # it runs, matching the optimizer's own tagging. Only changes WHICH weights share a
+    # rank, never how fast any weight is.
+    parser.add_argument("--layout-cost", choices=["legacy", "cost-aware"], default="legacy")
     # Newton-Schulz requires fp32: it runs on Muon's momentum, which the optimizer keeps
     # in fp32 regardless of the parameter dtype. bf16 raises ValueError.
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16"])
@@ -415,9 +437,41 @@ def main() -> None:
     )
 
     # Collapse the dp_size ranks into distinct ownership profiles.
+    layout_cost_fn = None
+    if config.layout_cost == "cost-aware":
+        assert HAVE_MEGATRON, (
+            "--layout-cost cost-aware needs megatron.core.optimizer.emerging_optimizers "
+            "for the per-mode cost model; put the Megatron repo root on PYTHONPATH."
+        )
+        hw = _hardware_profile()
+        assert hw is not None, "--layout-cost cost-aware needs a HardwareProfile for this GPU."
+
+        def layout_cost_fn(matrix):  # noqa: F811 - deliberate rebind of the None default
+            (rows, cols), sc = matrix
+            costs = _tp_mode_costs(
+                rows * sc,
+                cols,
+                sc,
+                config.num_ns_steps,
+                config.use_syrk,
+                2 if config.fp32_matmul_prec == "medium" else 4,
+                communication_crosses_domain=(config.group == "egtp"),
+                profile=hw,
+            )
+            # Expert weights and unsharded weights never consult the cost model; see
+            # resolve_auto_mode for the same scoping.
+            mode = (
+                min(costs, key=costs.get)
+                if (sc > 1 and config.group != "egtp")
+                else "duplicated"
+            )
+            return costs[mode]
+
     profiles: Dict[Tuple, List[int]] = {}
     for dp_rank in range(dp_size):
-        signature = tuple(sorted(Counter(owned_matrices(matrices, dp_size, dp_rank)).items()))
+        signature = tuple(
+            sorted(Counter(owned_matrices(matrices, dp_size, dp_rank, layout_cost_fn)).items())
+        )
         profiles.setdefault(signature, []).append(dp_rank)
 
     distinct = sorted({matrix for sig in profiles for matrix, _ in sig}, key=lambda e: -ns_cost(e))

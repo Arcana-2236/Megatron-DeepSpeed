@@ -48,6 +48,12 @@ export MASTER_PORT=29512
 SYRK_OPTION=""
 if [[ "${USE_SYRK:-0}" == "1" ]]; then SYRK_OPTION="--use-syrk"; fi
 
+# LAYOUT_COST=cost-aware prices each weight in seconds under the mode it runs when
+# bin-packing weights onto DP shards, matching what the optimizer tags pre-DDP. Default
+# "legacy" keeps max*min^2 for every weight. Changes WHICH weights share a rank, never how
+# fast any weight is, so the per-shape table is unaffected and only STEP COST moves.
+# sbatch --export=ALL,USE_SYRK=1,LAYOUT_COST=cost-aware bench_ns_gtp.sbatch
+
 options=" \
     --group gtp \
     --modelled-world-size 12288 \
@@ -58,6 +64,7 @@ options=" \
     --iters 20 \
     --warmup 5 \
     --modes ${MODES:-duplicated distributed} \
+    --layout-cost ${LAYOUT_COST:-legacy} \
     ${SYRK_OPTION} "
 
 # REPO_DIR on PYTHONPATH so --modes auto can import _select_tp_mode from Megatron.
