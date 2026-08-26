@@ -2701,6 +2701,20 @@ def setup_model_and_optimizer(
             if args.freeze_all_layers:
                 model_config.pre_wrap_hooks.append(_freeze_all_model_chunks)
 
+            # Tag tp_mode / ns_compute_cost before DDP builds its buffers, so the LayerWise
+            # layout prices each weight by the mode Muon will actually run rather than
+            # assuming duplicated for all of them. A pre-wrap hook is the only place with
+            # both the un-wrapped chunks and the OptimizerConfig in scope; DDP itself
+            # receives only ddp_config.
+            if getattr(args, 'use_layer_wise_distributed_optimizer', False):
+                optimizer_config = cfg.optimizer
+
+                def _tag_muon_layout_cost(model_chunks):
+                    tag_params_for_buffer_routing(model_chunks, optimizer_config)
+                    return model_chunks
+
+                model_config.pre_wrap_hooks.append(_tag_muon_layout_cost)
+
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,

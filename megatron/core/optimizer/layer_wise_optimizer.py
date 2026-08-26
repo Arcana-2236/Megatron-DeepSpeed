@@ -71,7 +71,53 @@ def _bucket_is_managed_by_layer_wise_optimizer(bucket, default_for_untagged: boo
     return param.is_managed_by_layer_wise_optimizer
 
 
-def tag_params_for_buffer_routing(model_chunks) -> None:
+def _resolve_param_layout_cost(param, config: OptimizerConfig):
+    """Return ``(tp_mode, estimated_seconds)`` for *param*, or ``None`` if unmodellable.
+
+    Mirrors the dispatch in ``scaled_orthogonalize_fn_with_gtp_remat``: expert weights and
+    weights that are not GTP-sharded always take ``duplicated``; only dense GTP-sharded
+    weights consult the cost model, and only when tp_mode is "auto".
+
+    The cost is estimated SECONDS, not FLOPs, because LPT balances rank time and under
+    tp_mode="auto" one rank holds a mix of modes -- communication and launch latency are
+    60-80% of `distributed`'s total, so FLOPs alone are not comparable across modes.
+
+    Resolvable before the optimizer exists because the cost model is a pure function of the
+    shape, the group size and the optimizer config. Imported locally:
+    megatron.core.optimizer.__init__ imports this module, so a top-level import of
+    emerging_optimizers would be circular.
+    """
+    from .emerging_optimizers import _hardware_profile, _tp_mode_costs
+
+    gtp_size = (
+        getattr(param, 'gtp_remat_size', 1) if getattr(param, 'is_gtp_weight_remat', False) else 1
+    )
+    is_expert = not getattr(param, 'allreduce', True)
+    configured = getattr(config, 'muon_tp_mode', 'duplicated')
+
+    costs = _tp_mode_costs(
+        param.data.shape[0] * gtp_size,
+        param.data.shape[1],
+        gtp_size,
+        config.muon_num_ns_steps,
+        config.muon_use_syrk,
+        2 if config.muon_fp32_matmul_prec == "medium" else 4,
+        communication_crosses_domain=False,  # dense GTP stays inside one NVLink domain
+        profile=_hardware_profile(),
+    )
+    if costs is None:
+        return None  # no hardware profile: caller keeps the legacy FLOPs-shaped estimate
+
+    if is_expert or gtp_size <= 1:
+        mode = "duplicated"
+    elif configured == "auto":
+        mode = min(costs, key=costs.get)
+    else:
+        mode = configured if configured in costs else "duplicated"
+    return mode, costs[mode]
+
+
+def tag_params_for_buffer_routing(model_chunks, optimizer_config=None) -> None:
     """Tag every requires-grad param with ``is_managed_by_layer_wise_optimizer``.
 
     Run this once on the un-DDP-wrapped model chunks before
@@ -79,12 +125,30 @@ def tag_params_for_buffer_routing(model_chunks) -> None:
     grouping function ``group_params_for_buffers`` reads this attribute to
     decide which buffer each param lands in (LayerWise shard-aligned buffer vs
     DistOpt-style byte-level buffer).
+
+    When *optimizer_config* is given, also tags ``tp_mode`` so the layout's
+    ``_ns_compute_cost`` prices each weight by the mode it will actually run. Without it
+    the layout falls back to assuming ``duplicated`` for everything, which over-weights
+    GTP-sharded weights by up to ~4x and mis-packs the shards.
     """
+    tagged: Dict[str, int] = {}
     for model_chunk in model_chunks:
         for param in model_chunk.parameters():
             if not param.requires_grad:
                 continue
             param.is_managed_by_layer_wise_optimizer = is_managed_by_layer_wise_optimizer(param)
+            if optimizer_config is not None and param.dim() == 2:
+                resolved = _resolve_param_layout_cost(param, optimizer_config)
+                if resolved is not None:
+                    param.tp_mode, param.ns_compute_cost = resolved
+                    tagged[param.tp_mode] = tagged.get(param.tp_mode, 0) + 1
+    if tagged:
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"layout cost tagging: {dict(sorted(tagged.items()))} "
+            f"(muon_tp_mode={getattr(optimizer_config, 'muon_tp_mode', None)})",
+        )
 
 
 def _build_gtp_replica_fold(pg_collection, model_chunks) -> Dict[str, Tuple[int, int]]:
@@ -263,14 +327,26 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             ~ max(M,N) * min(M,N)^2, the dominant term in the orthogonalization;
             GTP-sharded params reconstruct the full post-AllGather shape first
             (GTP always shards along dim 0).
+
+            That formula is the ``duplicated`` cost. When ``tag_params_for_buffer_routing``
+            has tagged ``tp_mode``, price the mode the weight will actually run instead:
+            ``distributed`` shards the min^2*max terms over the group and keeps the same
+            replicated min^3, so at GTP=64 the cube term dominates and a tall weight costs
+            far less than max*min^2 suggests. Untagged params keep the old formula, so
+            non-Muon runs and any caller that does not pass the config are unchanged.
             """
             if param.dim() != 2:
                 return param.data.nelement()
             m, n = param.data.shape
-            if getattr(param, 'is_gtp_weight_remat', False):
-                m = m * getattr(param, 'gtp_remat_size', 1)
+            gtp_size = (
+                getattr(param, 'gtp_remat_size', 1)
+                if getattr(param, 'is_gtp_weight_remat', False)
+                else 1
+            )
+            m = m * gtp_size
             big, small = max(m, n), min(m, n)
-            return big * small * small
+            tagged = getattr(param, 'ns_compute_cost', None)
+            return tagged if tagged is not None else big * small * small
 
         def _emit_bucket(
             chunk_params: List[torch.nn.Parameter], shared_embedding: bool = False

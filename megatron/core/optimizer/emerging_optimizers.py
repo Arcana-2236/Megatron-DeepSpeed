@@ -228,6 +228,30 @@ def _select_tp_mode(
     """Cost model for per weight tp_mode selection. Mirrors the op sequence in
     scaled_orthogonalize_fn_with_gtp_remat -- keep in sync.
     """
+    cost = _tp_mode_costs(
+        m, n, group_size, steps, use_syrk, elem_size,
+        communication_crosses_domain, profile, candidates,
+    )
+    return "duplicated" if cost is None else min(candidates, key=cost.get)
+
+
+def _tp_mode_costs(
+    m: int,
+    n: int,
+    group_size: int,
+    steps: int,
+    use_syrk: bool,
+    elem_size: int,
+    communication_crosses_domain: bool,
+    profile: Optional[HardwareProfile] = None,
+    candidates: tuple[str, ...] = _AUTO_TP_MODES,
+) -> Optional[Dict[str, float]]:
+    """Per-mode estimated seconds for one orthogonalization, or None without a profile.
+
+    The layout uses these values directly: LPT balances rank TIME, and under tp_mode="auto"
+    one rank holds a mix of modes, so FLOPs alone are not comparable across them --
+    communication and launch latency are 60-80% of `distributed`'s total.
+    """
     min_dim, max_dim = min(m, n), max(m, n)
     # dist no longer forces the transpose: it orients so the Gram lands on min(m, n),
     # transposing when m > n and resharding via all-to-all when m < n. So both modes
@@ -246,10 +270,11 @@ def _select_tp_mode(
         ),
     }
     if profile is None:
-        # Unregistered hardware: keep today's default rather than guess. Selecting on FLOPs
-        # would always say distributed. That would commit to `steps`
-        # Gram all-reduces per weight without any bandwidth number to price them against.
-        return "duplicated"
+        # Unregistered hardware: no bandwidth or latency numbers, so no cost can be formed.
+        # Callers fall back to their own default rather than guess; selecting on FLOPs alone
+        # would always answer distributed, committing to `steps` Gram all-reduces per weight
+        # with nothing to price them against.
+        return None
 
     ring_fraction = (
         group_size - 1
@@ -282,7 +307,7 @@ def _select_tp_mode(
         mode: flops[mode] / peak + num_bytes[mode] / bw + num_collectives[mode] * alpha
         for mode in candidates
     }
-    return min(candidates, key=cost.get)
+    return cost
 
 
 class TensorParallelMuon(OrthogonalizedOptimizer):
