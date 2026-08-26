@@ -68,96 +68,85 @@ class Net(nn.Module):
 # ===========================================================================
 
 
-def test_select_tp_mode_flops_only_fallback():
-    """Without a hardware profile, select by FLOPs or the cross-domain fallback."""
-    assert (
-        _select_tp_mode(
-            m=8192,
-            n=1024,
-            group_size=8,
-            steps=5,
-            use_syrk=False,
-            elem_size=2,
-            communication_crosses_domain=False,
-            profile=None,
-        )
-        == "distributed"
-    )
-    assert (
-        _select_tp_mode(
-            m=8192,
-            n=1024,
-            group_size=8,
-            steps=5,
-            use_syrk=False,
-            elem_size=2,
-            communication_crosses_domain=True,
-            profile=None,
-        )
-        == "duplicated"
-    )
+def test_select_tp_mode_no_profile_keeps_default():
+    """Unregistered hardware keeps duplicated regardless of shape or domain crossing."""
+    for m, n in ((8192, 1024), (1024, 8192)):
+        for crosses in (False, True):
+            assert (
+                _select_tp_mode(
+                    m=m,
+                    n=n,
+                    group_size=8,
+                    steps=5,
+                    use_syrk=False,
+                    elem_size=2,
+                    communication_crosses_domain=crosses,
+                    profile=None,
+                )
+                == "duplicated"
+            )
 
 
-def test_select_tp_mode_with_profile():
-    """A hardware profile selects different modes for tall and wide matrices."""
+def test_select_tp_mode_orientation_symmetric():
+    """Tall and wide are now priced identically: dist orients the Gram onto min(m, n).
+
+    Before reshard, partition_dim=0 forced the transpose, so the wide case put the Gram on
+    the long dimension and was scored ~100x worse than its transpose. The two cases now
+    differ only in which branch of scaled_orthogonalize_fn_with_gtp_remat executes.
+    """
     profile = _PROFILES["GB200"]
-
-    assert (
-        _select_tp_mode(
-            m=8192,
-            n=1024,
-            group_size=8,
-            steps=5,
-            use_syrk=False,
-            elem_size=2,
-            communication_crosses_domain=False,
-            profile=profile,
-        )
-        == "distributed"
+    kwargs = dict(
+        group_size=8,
+        steps=5,
+        use_syrk=False,
+        elem_size=2,
+        communication_crosses_domain=False,
+        profile=profile,
     )
-    assert (
-        _select_tp_mode(
-            m=1024,
-            n=8192,
-            group_size=8,
-            steps=5,
-            use_syrk=False,
-            elem_size=2,
-            communication_crosses_domain=False,
-            profile=profile,
-        )
-        == "duplicated"
-    )
+    assert _select_tp_mode(m=8192, n=1024, **kwargs) == "distributed"
+    assert _select_tp_mode(m=1024, n=8192, **kwargs) == "distributed"
 
 
-def test_select_tp_mode_syrk_changes_selection():
-    """SYRK halves the Gram-op cost differently per mode -- can flip the selected mode."""
-    assert (
-        _select_tp_mode(
-            m=640,
-            n=1024,
-            group_size=8,
-            steps=5,
-            use_syrk=False,
-            elem_size=2,
-            communication_crosses_domain=False,
-            profile=None,
+def test_select_tp_mode_duplicated_when_comm_dominates():
+    """dist always wins on FLOPs, so only communication can select duplicated.
+
+    dist is duplicated with the min^2*max terms sharded and the same replicated min^3, so
+    its FLOPs are never higher. A small near-square matrix over a large group is the case
+    where the per-step Gram all-reduces outweigh duplicated's single all-gather.
+    """
+    profile = _PROFILES["GB200"]
+    for use_syrk in (False, True):
+        assert (
+            _select_tp_mode(
+                m=1024,
+                n=1024,
+                group_size=64,
+                steps=5,
+                use_syrk=use_syrk,
+                elem_size=2,
+                communication_crosses_domain=False,
+                profile=profile,
+            )
+            == "duplicated"
         )
-        == "duplicated"
-    )
-    assert (
-        _select_tp_mode(
-            m=640,
-            n=1024,
-            group_size=8,
-            steps=5,
-            use_syrk=True,
-            elem_size=2,
-            communication_crosses_domain=False,
-            profile=None,
-        )
-        == "distributed"
-    )
+
+
+def test_select_tp_mode_flops_alone_would_be_vacuous():
+    """Why the no-profile path cannot select on FLOPs: dist is unconditionally cheaper.
+
+    dist is duplicated with the min^2*max terms sharded and the same replicated min^3, so
+    dist - dup = steps*(gram+2)*min^2*max*(1/G - 1) < 0 for every shape at G > 1, SYRK or
+    not. A FLOPs-only comparison would therefore always answer "distributed" while ignoring
+    the `steps` Gram all-reduces that buy the saving, which is why _select_tp_mode keeps the
+    duplicated default instead when no HardwareProfile is available.
+    """
+    for use_syrk in (False, True):
+        for m, n in ((640, 1024), (1024, 640), (8192, 8192)):
+            mn, mx = min(m, n), max(m, n)
+            gram = 1 if use_syrk else 2
+            dup = 5 * (gram * (mn * mn * mx + mn**3) + 2 * mn * mn * mx)
+            dist = 5 * (gram * (mn * mn * (mx // 8) + mn**3) + 2 * mn * mn * (mx // 8))
+            assert dist < dup
 
 
 def test_resolve_tp_mode_caches(monkeypatch):

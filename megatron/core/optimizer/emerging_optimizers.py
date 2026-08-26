@@ -221,25 +221,42 @@ def _select_tp_mode(
     scaled_orthogonalize_fn_with_gtp_remat -- keep in sync.
     """
     min_dim, max_dim = min(m, n), max(m, n)
-    m_partitioned = (
-        m // group_size
-    )  # dist orthogonalizes the [n, m/group_size] shard; transpose is forced
+    # dist no longer forces the transpose: it orients so the Gram lands on min(m, n),
+    # transposing when m > n and resharding via all-to-all when m < n. So both modes
+    # iterate on the same [min, max] matrix and share the replicated min^3 term; dist
+    # differs only in sharding the min^2*max terms over the group.
+    max_partitioned = max_dim // group_size
     gram = 1 if use_syrk else 2  # SYRK halves the two gram ops
     # Per NS step: gram X@X.T + gram A@A + GEMM B@X.
     flops = {
         "duplicated": steps
         * (gram * (min_dim * min_dim * max_dim + min_dim**3) + 2 * min_dim * min_dim * max_dim),
-        "distributed": steps * (gram * (n * n * m_partitioned + n**3) + 2 * n * n * m_partitioned),
+        "distributed": steps
+        * (
+            gram * (min_dim * min_dim * max_partitioned + min_dim**3)
+            + 2 * min_dim * min_dim * max_partitioned
+        ),
     }
     if profile is None:
-        return "duplicated" if communication_crosses_domain else min(candidates, key=flops.get)
+        # Unregistered hardware: keep today's default rather than guess. Selecting on FLOPs
+        # would always say distributed. That would commit to `steps`
+        # Gram all-reduces per weight without any bandwidth number to price them against.
+        return "duplicated"
 
     ring_fraction = (
         group_size - 1
     ) / group_size  # ring: each rank moves (group_size-1)/group_size of the buffer
+    # The two all-to-alls of the m < n path are omitted: they are
+    # (max_dim/min_dim)/(group_size*steps) of the Gram all-reduce volume, under 1.5% for
+    # every shape in this model, and only matter if max/min exceeds group_size*steps.
     num_bytes = {
         "duplicated": m * n * elem_size * ring_fraction,  # one all-gather
-        "distributed": steps * 2 * n * n * elem_size * ring_fraction,  # gram all-reduce per step
+        "distributed": steps
+        * 2
+        * min_dim
+        * min_dim
+        * elem_size
+        * ring_fraction,  # gram all-reduce per step, Gram is [min, min]
     }
     bw = (profile.bw_inter_gbps if communication_crosses_domain else profile.bw_intra_gbps) * 1e9
     peak = profile.bf16_peak_tflops * 1e12
