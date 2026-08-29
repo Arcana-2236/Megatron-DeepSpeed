@@ -289,6 +289,12 @@ class OptimizerConfig:
     muon_use_syrk: bool = False
     """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
 
+    muon_expert_batch_size: int = 1
+    """Number of same-shaped expert weights per GTP all-gather. Above 1, the batch shares
+    one collective and runs a single 3-D Newton-Schulz, trading a transient stacked buffer
+    for fewer collectives and fewer kernel launches. Falls back to per-weight Newton-Schulz 
+    (collective still shared) when expert TP is active. 1 disables batching."""
+
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 

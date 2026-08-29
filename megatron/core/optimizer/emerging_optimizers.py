@@ -11,6 +11,7 @@ To add a new emerging optimizer:
 import inspect
 import logging
 from dataclasses import dataclass, field
+from itertools import groupby
 from typing import Any, Callable, Dict, Literal, Optional, get_args
 
 import torch
@@ -29,6 +30,7 @@ from .optimizer_config import ParamKey, ParamPredicate
 
 try:
     from emerging_optimizers import registry
+    from emerging_optimizers import utils as eo_utils
     from emerging_optimizers.orthogonalized_optimizers import (
         AdaptiveMuon,
         OrthogonalizedOptimizer,
@@ -332,9 +334,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
         use_syrk: bool = False,
+        expert_batch_size: int = 1,
     ) -> None:
         if num_ns_steps < 1:
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
+        if expert_batch_size < 1:
+            raise ValueError(f"expert_batch_size must be at least 1, got {expert_batch_size}")
         if use_syrk and not is_emerging_optimizers_min_version(_SYRK_MIN_EO_VERSION):
             raise ValueError(
                 f"use_syrk requires emerging_optimizers >= {_SYRK_MIN_EO_VERSION}, but "
@@ -381,6 +386,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         # For the tp_mode="auto" cost model (_resolve_tp_mode / _select_tp_mode).
         self.num_ns_steps = num_ns_steps
         self.use_syrk = use_syrk
+        self.expert_batch_size = expert_batch_size
+        self._chunk_cache: Dict[int, tuple] = {}  # param-group index -> (len, chunks)
+        if expert_batch_size > 1:
+            log_single_rank(
+                logger, logging.INFO, f"muon expert_batch_size={expert_batch_size}"
+            )
         self.elem_size = 2 if fp32_matmul_prec == "medium" else 4  # bf16 vs tf32/fp32
         self._tp_mode_cache: Dict[tuple, str] = {}
         self._hw_profile = _hardware_profile() if tp_mode == "auto" else None
@@ -457,6 +468,137 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 f"{self._tp_mode_cache[key]}",
             )
         return self._tp_mode_cache[key]
+
+    def _expert_batch_key(self, p: torch.Tensor) -> Optional[tuple]:
+        """Key grouping expert weights that can share one all-gather; None to not batch."""
+        if self.expert_batch_size <= 1 or not self.pg_collection:
+            return None
+        if not (getattr(p, 'expert_tp', False) and getattr(p, 'is_gtp_weight_remat', False)):
+            return None
+        if get_pg_size(self.pg_collection.expt_gtp_remat) <= 1:
+            return None
+        # Expert weights are always "duplicated" (see scaled_orthogonalize_fn_with_gtp_remat),
+        # and only "duplicated" all-gathers per weight, so only it has a collective to share.
+        return (tuple(p.shape), p.dtype)
+
+    def _chunks_for(self, index: int, group: Dict[str, Any]) -> list:
+        """Units of work for *group*: ``[p]`` normally, or a batch of expert weights.
+
+        Batches only *adjacent* same-key params, which keeps a batch within one MoE layer.
+        Cached on the group's index: the param list is fixed after construction, and the
+        index is stable for the optimizer's life (``id()`` would be recyclable).
+        """
+        params = group["params"]
+        cached = self._chunk_cache.get(index)
+        if cached is not None and cached[0] == len(params):
+            return cached[1]
+
+        chunks: list = []
+        for key, run in groupby(params, self._expert_batch_key):
+            run = list(run)
+            width = self.expert_batch_size if key is not None else 1
+            chunks += [run[i : i + width] for i in range(0, len(run), width)]
+
+        batched = [c for c in chunks if len(c) > 1]
+        if batched:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"muon expert batching: {len(batched)} batches, "
+                f"widths={sorted({len(c) for c in batched})}, "
+                f"{len(params)} params -> {len(chunks)} units",
+            )
+        self._chunk_cache[index] = (len(params), chunks)
+        return chunks
+
+    def _orthogonalize_expert_batch(self, params: list, grads: list) -> list:
+        """Orthogonalize same-shaped expert momenta over one shared GTP all-gather.
+
+        Stacks to ``[B, M/G, N]`` and gathers on dim 1 -- the shard dim, moved from 0 by
+        the stack -- then runs one 3-D Newton-Schulz over the batch and re-shards. Cutting
+        the kernel count is what removes the per-boundary GPU stall; the shared collective
+        alone does not (measured, job 2665765).
+        """
+        gtp_group = self.pg_collection.expt_gtp_remat
+        tp_group = self.pg_collection.expt_tp
+        # The dense duplicated path strips/restores GTP alignment padding; this one does
+        # not, so refuse a padded weight rather than orthogonalize the pad rows as data.
+        assert all(getattr(p, "pad_length", 0) == 0 for p in params), (
+            "muon expert batching does not support GTP alignment padding"
+        )
+        shard = grads[0].shape[0]
+        lo = get_pg_rank(gtp_group) * shard
+        rows = shard * get_pg_size(gtp_group)
+
+        torch.cuda.nvtx.range_push(f"muon_ns_x{len(params)}:({rows}, {grads[0].shape[1]})")
+        gathered = self._all_gather_tensor(torch.stack(grads), gtp_group, 1)
+
+        if get_pg_size(tp_group) == 1:
+            # GTP is already undone by the gather, so the batched call must not re-enter
+            # the TP path: partition_dim=None.
+            orth = self.scaled_orthogonalize_fn(
+                gathered, tp_group, None, tp_mode_this_group="duplicated"
+            )
+            out = [orth[i, lo : lo + shard].contiguous() for i in range(len(params))]
+        else:
+            # newton_schulz_tp cannot express a TP gather on dim+1 for 3-D input, so the
+            # batch shares the collective but orthogonalizes per expert.
+            pdim = getattr(params[0], "partition_dim", None)
+            pdim = None if pdim == -1 else pdim
+            out = [
+                self.scaled_orthogonalize_fn(
+                    g, tp_group, pdim, tp_mode_this_group="duplicated"
+                )[lo : lo + shard].contiguous()
+                for g in gathered
+            ]
+        torch.cuda.nvtx.range_pop()
+        return out
+
+    @torch.no_grad()  # type: ignore[misc]
+    def step(self, closure: Optional[Callable] = None) -> Optional[float]:
+        """Optimizer step; identical to the base class when ``expert_batch_size == 1``.
+
+        Above 1, expert weights are orthogonalized in batches so one all-gather and one
+        Newton-Schulz serve the batch. All per-weight work -- weight decay, momentum, the
+        update -- is unchanged.
+        """
+        if closure is not None:
+            raise ValueError("closure is not supported")
+
+        for index, group in enumerate(self.param_groups):
+            self._init_group(group)
+            group_kwargs = {k: v for k, v in group.items() if k != "params"}
+            lr, momentum = group["lr"], group["momentum"]
+
+            for chunk in self._chunks_for(index, group):
+                have = [p for p in chunk if p.grad is not None]
+                if not have:
+                    continue
+                # Chunk width sets the collective's shape, so it must be rank-invariant:
+                # a partially-gradded batch would desync the all-gather rather than error.
+                assert len(have) == len(chunk) or len(chunk) == 1, (
+                    "muon expert batch has partial gradients; chunking is not rank-invariant"
+                )
+
+                grads = []
+                for p in chunk:
+                    self._apply_weight_decay_inplace(p, p.grad, lr, group["weight_decay"])
+                    buf = self.state[p]["momentum_buffer"]
+                    buf.lerp_(p.grad, 1 - momentum)
+                    grads.append(p.grad.lerp(buf, momentum) if self.nesterov else buf)
+
+                with eo_utils.fp32_matmul_precision(self.fp32_matmul_prec):
+                    if len(chunk) > 1:
+                        orth_grads = self._orthogonalize_expert_batch(chunk, grads)
+                    else:
+                        orth_grads = [self.orthogonalize(chunk[0], grads[0], **group_kwargs)]
+
+                for p, orth_grad in zip(chunk, orth_grads):
+                    self.pre_weight_update_fn_inplace(p, orth_grad)
+                    p.add_(orth_grad, alpha=-lr)
+                    self.post_weight_update_fn_inplace(p)
+
+        return None
 
     def scaled_orthogonalize_fn_with_gtp_remat(self, p, grad, tp_group, partition_dim):
         """Orthogonalize a (possibly GTP-sharded) momentum, then reshard.
