@@ -26,7 +26,7 @@ export NCCL_DEBUG=WARN
 
 ROOT_DIR="/lustre/fsw/coreai_dlalgo_llm/zhengywang/dist_muon"
 REPO_DIR="${ROOT_DIR}/Megatron-LM-experiments"
-IMAGE_PATH="${IMAGE_PATH:-${ROOT_DIR}/images/mcore-moe-te-main-hybridep-cutedsl-arm.sqsh}"
+IMAGE_PATH="${IMAGE_PATH:-${ROOT_DIR}/images/mcore-moe-te-main-hybridep-cutedsl-arm-eo-batchedsyrk.sqsh}"
 
 # TAG separates runs on different hardware, e.g. sbatch -p gb200 --export=ALL,TAG=gb200
 NAME="perfbot/run1/ns_bench/egtp${TAG:+_$TAG}"
